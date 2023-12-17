@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+
+################################################################################
+## Script to launch new AWS EC2 instances.
+##
+## Getting started: Create an AWS access key, download it, then run:
+##   aws configure
+## and enter the key information and AWS region.
+################################################################################
+
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+################################################################################
+## Parameters for this script
+
+## Default launch configuration
+CONFIG=${SCRIPT_DIR}/example-fleet-config.json
+
+## ID of a persistent volume to attach to the new instance
+##
+## To get information on EBS volumes, run:
+##   aws ec2 describe-volumes
+PERSISTENT_VOLUME_ID=""
+
+################################################################################
+## Additional constants for use in script.  You probably don't need to modify
+## these.
+
+## Time in seconds to wait for instance updates
+REQUEST_WAIT_TIME=60
+INSTANCE_WAIT_TIME=60
+
+################################################################################
+## Utility functions
+
+VERBOSE=0
+
+# Usage message
+function usage {
+    >&2 echo "${SCRIPT_NAME}: Launch a new AWS instance."
+    >&2 echo "Usage:"
+    >&2 echo -e "${SCRIPT_NAME} [-v|-vv] [--config <config.json>] [--instance-id <instance_id>]"
+    >&2 echo -e "\t--config <config>: Use the specified launch config.  Default: ${CONFIG}"
+    >&2 echo -e "\t--instance-id <instance_id>: Initialize the specified instance ID, rather than launch a new instance."
+    >&2 echo -e "\t-v|-vv: Set level of verbose output"
+    >&2 echo -e "${SCRIPT_NAME} -h|--help"
+    >&2 echo -e "\tPrint this help message"
+    exit $1
+}
+
+# Print error message and exit
+function exit_with_error {
+    >&2 echo "[${SCRIPT_NAME}] [ERROR] $1"
+    exit 1
+}
+
+# Exit if the specified file does not exist
+function check_file_exists {
+    test -f "$1" || exit_with_error "File $1 not found."
+}
+
+################################################################################
+## Main script
+
+## Parse command-line arguments
+while [[ $# > 0 ]]
+do
+    key="$1"
+    case $key in
+        -h|--help)
+            usage 0
+            ;;
+        -v)
+            VERBOSE=1
+            shift
+            ;;
+        -vv)
+            VERBOSE=2
+            shift
+            ;;
+        --instance-id)
+            INSTANCE_ID=$2
+            shift 2
+            ;;
+        --config)
+            CONFIG=$2
+            shift 2
+            ;;
+        *)
+            >&2 echo "Unrecognized option: '$1'"
+            usage 1
+            ;;
+    esac
+done
+
+set -e
+
+# Print log message
+function log {
+    test $VERBOSE -lt 1 || echo "[${SCRIPT_NAME}] [Info] $1"
+}
+
+# Enable verbose output if requested
+test $VERBOSE -lt 2 || set -x
+
+################################################################################
+## Request a new spot instance, if no instance ID was specified.
+if [ -z $INSTANCE_ID ]; then
+    check_file_exists "$CONFIG"
+    # Get the instance ID from the output.
+    INSTANCE_ID=$(aws ec2 create-fleet --cli-input-json file://"$CONFIG" | jq -r '.Instances[0].InstanceIds[0]')
+fi
+
+if [ -z $INSTANCE_ID ] || [ "$INSTANCE_ID" == "null" ]; then
+    exit_with_error "Could not obtain instance ID"
+fi
+
+echo "Got instance ID: $INSTANCE_ID"
+
+# Get the instance DNS and type
+INSTANCE_DESCRIP=$(aws ec2 describe-instances --filters Name=instance-id,Values=$INSTANCE_ID)
+INSTANCE_DNS=$(echo $INSTANCE_DESCRIP | jq -r '.Reservations[0].Instances[0].PublicDnsName')
+INSTANCE_TYPE=$(echo $INSTANCE_DESCRIP | jq -r '.Reservations[0].Instances[0].InstanceType')
+
+# Print the instance DNS and type
+echo "DNS:  $INSTANCE_DNS"
+echo "Type: $INSTANCE_TYPE"
+
+################################################################################
+## Wait for the instance to start running and pass status checks.
+
+## Read the current instance state.
+INSTANCE_STATE=$(aws ec2 describe-instance-status --instance-ids $INSTANCE_ID | jq -r '.InstanceStatuses[0].InstanceState.Name')
+
+## If the instance state is 'pending' or 'null', wait for a bit for the instance
+## to start running.
+##
+## Typically, the instance will only be 'pending' or 'null' for a short time
+## before it either starts running or, rarely, fails to start.  Hence just one
+## check is done here of whether the instance state is 'pending' or 'null'.
+if [ "$INSTANCE_STATE" == "pending" ] || [ "$INSTANCE_STATE" == "null" ]; then
+    echo "Sleeping to wait for instance to start running."
+    sleep $INSTANCE_WAIT_TIME
+    ## Reread the instance state
+    INSTANCE_STATE=$(aws ec2 describe-instance-status --instance-ids $INSTANCE_ID | jq -r '.InstanceStatuses[0].InstanceState.Name')
+fi
+
+## Wait for the system status check.
+while [ "$INSTANCE_STATE" == "running" ]; do
+    SYSTEM_STATUS=$(aws ec2 describe-instance-status --instance-ids $INSTANCE_ID | jq -r '.InstanceStatuses[0].SystemStatus.Status')
+    echo "Instance state: $INSTANCE_STATE, System status: $SYSTEM_STATUS"
+    # Break this loop if the system status is ok.
+    test "$SYSTEM_STATUS" == "ok" && break
+    echo "Sleeping for $INSTANCE_WAIT_TIME seconds"
+    sleep $INSTANCE_WAIT_TIME
+    ## Reread the instance state
+    INSTANCE_STATE=$(aws ec2 describe-instance-status --instance-ids $INSTANCE_ID | jq -r '.InstanceStatuses[0].InstanceState.Name')
+done
+
+## Wait for the instance status check.
+while [ "$INSTANCE_STATE" == "running" ]; do
+    INSTANCE_STATUS=$(aws ec2 describe-instance-status --instance-ids $INSTANCE_ID | jq -r '.InstanceStatuses[0].InstanceStatus.Status')
+    echo "Instance state: $INSTANCE_STATE, Instance status: $INSTANCE_STATUS"
+    # Break this loop if the instance status is ok.
+    test "$INSTANCE_STATUS" == "ok" && break
+    echo "Sleeping for $INSTANCE_WAIT_TIME seconds"
+    sleep $INSTANCE_WAIT_TIME
+    INSTANCE_STATE=$(aws ec2 describe-instance-status --instance-ids $INSTANCE_ID | jq -r '.InstanceStatuses[0].InstanceState.Name')
+done
+
+## If the instance is not running at this point, stop early.
+test $INSTANCE_STATE == "running" || exit_with_error "Instance is not running!  Instance state: '$INSTANCE_STATE'"
+
+log "Instance status checks passed."
+
+################################################################################
+## Attach persistent volume
+
+if [ -n "$PERSISTENT_VOLUME_ID" ]; then
+    AVAIL=$(aws ec2 describe-volumes --volume-ids "$PERSISTENT_VOLUME_ID" --filters Name=status,Values=available --output text)
+    if [ -n "$AVAIL" ]; then
+        aws ec2 attach-volume --device /dev/xvdf --instance $INSTANCE_ID --volume $PERSISTENT_VOLUME_ID
+    else
+        echo "Skipping $PERSISTENT_VOLUME_ID: not available"
+    fi
+    log "Volume mounted."
+fi
+
+################################################################################
+## Print out the instance's hostname
+
+log "Instance is ready"
+echo $INSTANCE_DNS

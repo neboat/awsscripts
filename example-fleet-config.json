@@ -1,0 +1,35 @@
+{
+    "SpotOptions":{
+        "SingleInstanceType": true,
+        "SingleAvailabilityZone": true,
+        "MinTargetCapacity": 1,
+        "AllocationStrategy": "price-capacity-optimized",
+        "InstanceInterruptionBehavior": "terminate"
+    },
+    "OnDemandOptions":{
+        "AllocationStrategy": "lowest-price",
+        "SingleInstanceType": true,
+        "SingleAvailabilityZone": true,
+        "MinTargetCapacity": 0
+    },
+    "LaunchTemplateConfigs":[
+        {
+            "LaunchTemplateSpecification":{
+                "LaunchTemplateId":"<Your Launch Template ID>",
+                "Version":"1"
+            },
+            "Overrides":[
+                {
+                    "InstanceType": "c5.4xlarge",
+                    "SubnetId": "subnet-046d6a73"
+                }
+            ]
+        }
+    ],
+    "TargetCapacitySpecification":{
+        "TotalTargetCapacity": 1,
+        "OnDemandTargetCapacity": 0,
+        "DefaultTargetCapacityType": "spot"
+    },
+    "Type":"instant"
+}

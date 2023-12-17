@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+
+################################################################################
+## Script to set up a new AWS EC2 instance.
+##
+## Given a specified running EC2 instance, this script can perform the following
+## setup steps:
+## - Create a new user on the EC2 instance with its own SSH-key-based login.
+## - Install a set of packages.
+## - Copy configuration files from a local directory to the user's home
+##   directory on the instance.
+## - Mount an attached persistent volume to a default directory.
+## - Perform simple system quiescing and enable performance counters on the
+##   instance.
+## - Set a user's password on the instance for sudo.
+################################################################################
+
+################################################################################
+## Parameters for this script.  Set these as appropriate for your AWS instance.
+
+# Filename of private key for AWS key pair used to create instance
+AWS_KEY_PAIR=""  # FILL THIS IN
+# Username of new user to create on instance.  Defaults to ${USER}
+AWS_USER=${USER}
+# Filename of private key for logging in as AWS_USER
+AWS_USER_PRIVATE_KEY=""  # FILL THIS IN
+# Filename of public key for logging in as AWS_USER
+AWS_USER_PUBLIC_KEY="${AWS_USER_PRIVATE_KEY}.pub"
+# Packages to install, separated by spaces
+PACKAGES="file git make cmake linux-tools-generic clang lld"
+# Directory where to mount separate persistent volume
+PERSISTENT_VOLUME_MOUNT="/data"
+
+# Default user and package-management commands on the instance, determined by
+# the AMI used to launch the instance.
+AWS_ROOT_USER="ubuntu"
+PACKAGE_MANAGER_UPDATE_CMD="apt-get update"
+PACKAGE_MANAGER_INSTALL_CMD="apt-get -y install"
+
+################################################################################
+## Additional constants for use in script.  You probably don't need to modify
+## these.
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+HOME_CONFIG_FILES="${SCRIPT_DIR}/home_config"
+# Device on instance corresponding with an attached persistent volume.
+PERSISTENT_VOLUME="/dev/nvme1n1"
+
+################################################################################
+## Utility functions
+
+## Print usage
+function usage {
+    >&2 echo "${SCRIPT_NAME}: Sets up a new AWS instance."
+    >&2 echo "Usage:"
+    >&2 echo -e "${SCRIPT_NAME} [-v|-vv] [-u|--user <username>] [-s|--sudo] [-p|--pkg] [-l|--vol] [-c|--config] [--] <instance>"
+    >&2 echo -e "\t-u|--user <username>: Setup user <username>"
+    >&2 echo -e "\t-s|--sudo: Setup sudo for user"
+    >&2 echo -e "\t-p|--pkg: Install default packages"
+    >&2 echo -e "\t-l|--vol: Mount ${PERSISTENT_VOLUME} to ${PERSISTENT_VOLUME_MOUNT}"
+    >&2 echo -e "\t-c|--config: Copy configuration to remote HOME directory for new user"
+    >&2 echo -e "\t-q|--quiesce: Quiesce the system"
+    >&2 echo -e "\tIf none of the above options are specified, all are enabled by default, with username '${AWS_USER}'."
+    >&2 echo -e "\t-v|-vv: Set level of verbose output"
+    >&2 echo -e "${SCRIPT_NAME} -h|--help"
+    >&2 echo -e "\tPrint this help message"
+    exit $1
+}
+
+# Print error message and exit
+function exit_with_error {
+    >&2 echo "[${SCRIPT_NAME}] [ERROR] $1"
+    exit 1
+}
+
+# Exit if the specified variable is not set
+function check_variable_set {
+    test -n "${!1}" || exit_with_error "Variable $1 not set."
+}
+
+# Exit if the specified file does not exist
+function check_file_exists {
+    test -f "$1" || exit_with_error "File $1 not found."
+}
+
+################################################################################
+## Main script
+
+# Check that important variables have been defined.
+check_variable_set AWS_KEY_PAIR
+check_variable_set AWS_USER
+check_variable_set AWS_USER_PUBLIC_KEY
+
+## Process command-line arguments
+INSTANCE=ec2
+VERBOSE=0
+SPECIFIED_SETUP=0
+USER_SETUP=0
+SUDO_SETUP=0
+PKG_SETUP=0
+VOL_SETUP=0
+HOME_SETUP=0
+QUIESCE_SETUP=0
+while [[ $# > 0 ]]
+do
+    key="$1"
+    case $key  in
+        -h|--help)
+            usage 0
+            ;;
+        -v)
+            VERBOSE=1
+            shift
+            ;;
+        -vv)
+            VERBOSE=2
+            shift
+            ;;
+        -u|--user)
+            USER_SETUP=1
+            AWS_USER="$2"
+            shift 2
+            ;;
+        -s|--sudo)
+            SPECIFIED_SETUP=1
+            SUDO_SETUP=1
+            shift
+            ;;
+        -p|--pkg)
+            SPECIFIED_SETUP=1
+            PKG_SETUP=1
+            shift
+            ;;
+        -l|--vol)
+            SPECIFIED_SETUP=1
+            VOL_SETUP=1
+            shift
+            ;;
+        -c|--config)
+            SPECIFIED_SETUP=1
+            HOME_SETUP=1
+            shift
+            ;;
+        -q|--quiesce)
+            SPECIFIED_SETUP=1
+            QUIESCE_SETUP=1
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+test $# -ne 0 || exit_with_error "No instance specified."
+
+INSTANCE="$1"
+AWS_KEY_PAIR_FULL="${HOME}/.ssh/${AWS_KEY_PAIR}"
+AWS_USER_PRIVATE_KEY_FULL="${HOME}/.ssh/${AWS_USER_PRIVATE_KEY}"
+
+check_file_exists ${AWS_KEY_PAIR_FULL}
+
+# Home directory on instance for new user being created
+AWS_HOME="/home/${AWS_USER}"
+
+# Print log message
+function log {
+    test $VERBOSE -lt 1 || echo "[${SCRIPT_NAME}] [Info] $1"
+}
+
+# Run command on instance as root
+function run_remotely_as_root {
+    SSH_ROOT_LOGIN="-i ${AWS_KEY_PAIR_FULL} ${AWS_ROOT_USER}@${INSTANCE}"
+    ssh -t ${SSH_ROOT_LOGIN} "$@"
+}
+
+# If no specific setup step is given, do all setup steps by default
+if [ $SPECIFIED_SETUP -eq 0 ]; then
+    USER_SETUP=1
+    SUDO_SETUP=1
+    PKG_SETUP=1
+    VOL_SETUP=1
+    HOME_SETUP=1
+    QUIESCE_SETUP=1
+fi
+
+set -e
+
+log "Setting up instance '${INSTANCE}'."
+test $VERBOSE -lt 2 || set -x
+
+## Set up user
+if [ $USER_SETUP -eq 1 ]; then
+    log "Creating user '${AWS_USER}' and setting up SSH-key login."
+    check_file_exists ${HOME}/.ssh/${AWS_USER_PUBLIC_KEY}
+
+    # Copy public key
+    scp -i ${AWS_KEY_PAIR_FULL} ${HOME}/.ssh/${AWS_USER_PUBLIC_KEY} ${AWS_ROOT_USER}@${INSTANCE}:~/
+
+    # Create new user
+    run_remotely_as_root \
+        getent passwd ${AWS_USER} \> /dev/null\; \
+        if [ \$? -ne 0 ]\; then sudo adduser ${AWS_USER}\; fi \&\& \
+        sudo usermod -aG sudo ${AWS_USER} \&\& \
+        sudo -u ${AWS_USER} -- bash -c \
+        \"test -d ${AWS_HOME}/.ssh \&\& chmod 700 ${AWS_HOME}/.ssh \|\| mkdir -m 700 ${AWS_HOME}/.ssh\" \&\& \
+        sudo chmod 600 \${HOME}/${AWS_USER_PUBLIC_KEY} \&\& \
+        sudo chown ${AWS_USER}:${AWS_USER} \${HOME}/${AWS_USER_PUBLIC_KEY} \&\& \
+        sudo mv \${HOME}/${AWS_USER_PUBLIC_KEY} ${AWS_HOME}/.ssh/authorized_keys
+fi
+
+## sudo setup
+if [ $SUDO_SETUP -eq 1 ] && [ $USER_SETUP -ne 1 ]; then
+    log "Setting up sudo for ${AWS_USER}."
+    # ssh -t ${SSH_ROOT_LOGIN} sudo passwd ${AWS_USER}
+    run_remotely_as_root sudo passwd ${AWS_USER}
+fi
+
+## Install packages
+if [ $PKG_SETUP -eq 1 ]; then
+    log "Installing packages: $PACKAGES"
+    run_remotely_as_root sudo ${PACKAGE_MANAGER_UPDATE_CMD}
+    run_remotely_as_root sudo ${PACKAGE_MANAGER_INSTALL_CMD} $PACKAGES
+fi
+
+## Mount persistent volume
+if [ $VOL_SETUP -eq 1 ]; then
+    log "Mounting persistent volume ${PERSISTENT_VOLUME} to ${PERSISTENT_VOLUME_MOUNT}."
+    run_remotely_as_root \
+        "if (lsblk -p -d | grep ${PERSISTENT_VOLUME} > /dev/null); then \
+        test -d ${PERSISTENT_VOLUME_MOUNT} || sudo mkdir ${PERSISTENT_VOLUME_MOUNT} && \
+        sudo mount ${PERSISTENT_VOLUME} ${PERSISTENT_VOLUME_MOUNT} \
+        fi"
+fi
+
+## Copy local configuration files to remote home directory
+if [ $HOME_SETUP -eq 1 ]; then
+    log "Copying local configuration files in ${HOME_CONFIG_FILES} to remote home directory ${AWS_HOME}."
+    check_file_exists ${AWS_USER_PRIVATE_KEY_FULL}
+    # Copy any hidden files from in ${HOME_CONFIG_FILES} into user's home
+    # directory on instance.
+    scp -i ${AWS_USER_PRIVATE_KEY_FULL} -r ${HOME_CONFIG_FILES}/* ${AWS_USER}@${INSTANCE}:${AWS_HOME}/
+
+    # For any files with a "-addon" suffix in ${HOME_CONFIG_FILES}, append that
+    # file to the corresponding hidden file in the user's home directory on the
+    # instance.
+    for addon in $(find ${HOME_CONFIG_FILES} -name "*-addon"); do
+        addon_filename=$(basename ${addon})
+        remote_file_to_update=".${addon_filename%'-addon'}"
+        log "Appending contents of ${addon} to remote file ${remote_file_to_update}"
+        cat ${addon} | ssh -T -i ${AWS_USER_PRIVATE_KEY_FULL} ${AWS_USER}@${INSTANCE} "tee -a ${AWS_HOME}/${remote_file_to_update}"
+    done
+fi
+
+## Quiesce the system
+if [ $QUIESCE_SETUP -eq 1 ]; then
+    log "Quiescing system and enabling performance counters."
+    # Disable TurboBoost
+    INTEL_NOTURBO="/sys/devices/system/cpu/intel_pstate/no_turbo"
+    run_remotely_as_root sudo bash -c "test -f ${INTEL_NOTURBO} && echo 1 > ${INTEL_NOTURBO} || echo \"File not found: ${INTEL_NOTURBO}\""
+    # Disable Linux NUMA balancing
+    run_remotely_as_root sudo sysctl kernel.numa_balancing=0
+    # Enable performance counters
+    run_remotely_as_root sudo sysctl kernel.perf_event_paranoid=-1
+fi

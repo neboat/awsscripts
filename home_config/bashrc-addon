@@ -1,0 +1,7 @@
+
+# Setup SSH_AUTH_SOCK symlink to fix SSH agent forwarding with screen.
+# https://gist.github.com/martijnvermaat/8070533
+if [[ -S "$SSH_AUTH_SOCK" && ! -h "$SSH_AUTH_SOCK" ]]; then
+    ln -sf "$SSH_AUTH_SOCK" ~/.ssh/ssh_auth_sock;
+fi
+export SSH_AUTH_SOCK=~/.ssh/ssh_auth_sock;

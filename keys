@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+
+################################################################################
+## Script to set up an SSH agent for SSH-key forwarding.
+################################################################################
+
+################################################################################
+## Parameters for this script.
+
+## Names of SSH keys to add to agent.
+KEYS=""
+
+################################################################################
+## Main script.
+
+# Startup ssh-agent
+if [ -z  $SSH_AUTH_SOCK ]; then
+    eval $(ssh-agent -s)
+fi
+
+# Add keys to agent
+for key in $KEYS; do
+    if [ `ssh-add -l | grep $key -c` -eq 0 ]; then
+        ssh-add ${HOME}/.ssh/$key
+    fi
+done
