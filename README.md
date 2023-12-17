@@ -60,7 +60,7 @@ Once configured, simply run the `start` script to launch your AWS instance:
 
 The script will report its progress in launching the instance as it goes.  Once the instance is launched, the script will print the hostname of the newly launched instance.
 
-> ![NOTE]
+> [!NOTE]
 > You can create different configuration `json` files to launch instances and specify which configuration file `start` should use via the `--config` command-line flag.
 
 For more information on using the `start` script, run:
